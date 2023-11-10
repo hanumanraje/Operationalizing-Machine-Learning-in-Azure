@@ -127,31 +127,52 @@ def fit(self):
     return reg, metrics
 
 
-    def predict(self, pred_preprocessed_data):
-        """Predict work duration for input list of order numbers.
+def predict(self, pred_preprocessed_data, op_data_pred, pred_threshold, prep_models):
+    """Predict work duration for input data and adjust predictions based on pred_threshold.
 
-        Args:
-            pred_preprocessed_data: Preprocessed data containing features for prediction
-        Returns:
-            Dataframe with order number, operation key, and predicted values
-        """
-        if self.best_estimator is None:
-            print('Please fit the model before predicting')
-            return  # Return without making predictions if the model is not fitted
+    Args:
+        pred_preprocessed_data: Preprocessed data containing features for prediction.
+        op_data_pred: Raw pre-scaled operation data.
+        pred_threshold: The percentage of difference to adjust based on SAP prediction.
+        prep_models: Dict to save/load fitted preprocessing models.
 
-        # Handle categorical variables in the prediction data using label encoders from training
-        for col in pred_preprocessed_data.columns:
-            if col in self.label_encoders:
-                le = self.label_encoders[col]
-                pred_preprocessed_data[col] = le.transform(pred_preprocessed_data[col])
+    Returns:
+        Dataframe with order number, operation key, non-adjusted prediction, SAP prediction, and adjusted predictions.
+    """
+    if self.best_estimator is None:
+        print('Please fit the model before predicting')
+        return None
 
-        X_pred = pred_preprocessed_data.drop(self.features_excluded, axis=1)
-        y_preds = self.best_estimator.predict(X_pred)
+    # Handle categorical variables in the prediction data using label encoders from training
+    for col in pred_preprocessed_data.columns:
+        if col in self.label_encoders:
+            le = self.label_encoders[col]
+            pred_preprocessed_data[col] = le.transform(pred_preprocessed_data[col])
 
-        final_output = pd.DataFrame({
-            'order_number': pred_preprocessed_data['order_number'],
-            'operation_key': pred_preprocessed_data['operation_key'],
-            'predicted_values': y_preds
-        })
+    X_pred = pred_preprocessed_data.drop(self.features_excluded, axis=1)
+    y_preds = self.best_estimator.predict(X_pred)
 
-        return final_output
+    if "fitted_scaler" in prep_models:
+        pred_preprocessed_data['key'] = pred_preprocessed_data['order_number'].astype(int).astype(str) + \
+                                        '-' + pred_preprocessed_data['operation_key'].astype(int).astype(str)
+        pred_preprocessed_data.drop(columns=['forecast_man_hours'], inplace=True)
+        pred_preprocessed_data = pred_preprocessed_data.merge(op_data_pred[['key','forecast_man_hours']], how='left', on='key')
+        sap_preds = list(pred_preprocessed_data['forecast_man_hours'])
+    else:
+        sap_preds = list(pred_preprocessed_data['forecast_man_hours'])
+
+    y_preds_adj = [sap_preds[i] + (y_preds[i] - sap_preds[i]) * pred_threshold for i in range(len(y_preds))]
+
+    final_output = pd.DataFrame({
+        'order_number': pred_preprocessed_data['order_number'],
+        'operation_key': pred_preprocessed_data['operation_key'],
+        'SAP_pred': sap_preds,
+        'non_adjusted_pred': y_preds,
+        'adjusted_pred': y_preds_adj
+    })
+
+    final_output['non_adjusted_pred'] = round(final_output['non_adjusted_pred'], 1)
+    final_output['adjusted_pred'] = round(final_output['adjusted_pred'], 1)
+
+    return final_output
+
