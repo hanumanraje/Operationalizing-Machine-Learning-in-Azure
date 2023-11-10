@@ -95,39 +95,37 @@ class LightGBMModel:
 
         return X_train, X_test, y_train, y_test
 
-    def fit(self):
-        """Trains the LightGBM Regressor model on training data, uses grid search to find the best parameters.
+def fit(self):
+    self.X_train, self.X_test, self.y_train, self.y_test = self._split_operation_data(self.preprocessed_data)
 
-        Returns:
-            Regressor with the best fit parameters
-        """
-        self.X_train, self.X_test, self.y_train, self.y_test = self._split_operation_data(self.preprocessed_data)
+    lgb_train = lgb.Dataset(self.X_train, self.y_train)
+    lgb_eval = lgb.Dataset(self.X_test, self.y_test, reference=lgb_train)
 
-        if self.grid_search_flag:
-            reg = lgb.LGBMRegressor(**self.model_params)
-            search = GridSearchCV(
-                reg,
-                param_grid=self.grid_search_parameters,
-                cv=self.cv_splits
-            )
-            search.fit(X=self.X_train, y=self.y_train)
-            reg_bestfit = search.best_estimator_
-        else:
-            reg_bestfit = lgb.LGBMRegressor(**self.model_params)
-            reg_bestfit.fit(self.X_train, self.y_train)
+    reg = lgb.train(
+        self.model_params,
+        lgb_train,
+        valid_sets=[lgb_train, lgb_eval],
+        verbose_eval=100,
+        early_stopping_rounds=50,
+        num_boost_round=10000
+    )
 
-        self.best_estimator = reg_bestfit
+    self.best_estimator = reg
 
-        y_preds = reg_bestfit.predict(self.X_test)
+    y_preds = reg.predict(self.X_test)
 
-        metrics = self._metrics_calculation(self.y_test, y_preds)
+    metrics = self._metrics_calculation(self.y_test, y_preds)
 
-        logger = logging.getLogger(__name__)
-        logger.info(f"Model includes the following features: {self.X_train.columns}")
-        logger.info(f"Model uses the following parameters: {reg_bestfit.get_params()}")
-        logger.info(f"Model's test scores: {metrics}")
+    logger = logging.getLogger(__name__)
+    logger.info(f"Model includes the following features: {list(self.X_train.columns)}")
+    logger.info(f"Model's test scores: {metrics}")
 
-        return reg_bestfit
+    explainer = shap.Explainer(reg)
+    self.shap_values = explainer.shap_values(pd.DataFrame(self.X_test, columns=self.X_train.columns))
+
+    logger.info(f"Returning from fit: reg = {reg}, metrics = {metrics}")
+    return reg, metrics
+
 
     def predict(self, pred_preprocessed_data):
         """Predict work duration for input list of order numbers.
