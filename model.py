@@ -1,32 +1,32 @@
+from typing import Dict, List, Optional, Tuple
 import pandas as pd
 import numpy as np
+import lightgbm as lgb
 import logging
-import matplotlib.pyplot as plt
-import shap
 from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GridSearchCV
 from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import mean_absolute_error, mean_squared_error, mean_squared_log_error
-import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense, Activation
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.callbacks import EarlyStopping
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 
-class NeuralNetworkModel:
+class LightGBMModel:
     def __init__(
         self,
         preprocessed_data: pd.DataFrame = pd.DataFrame(),
         output: str = 'clock_hours',
-        date_cutoff: str = '2023-02-20',
         features_excluded: List[str] = ['operation_key', 'order_number'],
         model_params: Optional[Dict] = {
-            "hidden_layers": [64, 32],
-            "activation": "relu",
-            "learning_rate": 0.001,
-            "epochs": 100,
-            "batch_size": 32,
-            "early_stopping_patience": 10,
+            "objective": "regression",
+            "metric": "rmse",
+            "boosting_type": "gbdt",
+            "num_leaves": 31,
+            "learning_rate": 0.05,
             "random_state": 42
+        },
+        grid_search_flag: bool = True,
+        grid_search_parameters: Optional[Dict] = {
+            "num_leaves": [31, 50, 100],
+            "learning_rate": [0.05, 0.1, 0.2],
+            "n_estimators": [100, 200, 300]
         },
         scoring_metrics: List[str] = ["MAE", "MSE", "RMSE"],
         test_size: float = 0.2,
@@ -38,9 +38,10 @@ class NeuralNetworkModel:
     ) -> None:
         self.preprocessed_data = preprocessed_data
         self.output = output
-        self.date_cutoff = date_cutoff
         self.features_excluded = features_excluded
         self.model_params = model_params
+        self.grid_search_flag = grid_search_flag
+        self.grid_search_parameters = grid_search_parameters
         self.scoring_metrics = scoring_metrics
         self.test_size = test_size
         self.cv_splits = cv_splits
@@ -50,8 +51,7 @@ class NeuralNetworkModel:
         self.X_test = np.array([])
         self.y_train = []
         self.y_test = []
-        self.model = None
-        self.history = None
+        self.best_estimator = None
         self.shap_values = []
         self.label_encoders = {}  # Dictionary to store label encoders for categorical variables
 
@@ -90,60 +90,54 @@ class NeuralNetworkModel:
                 self.label_encoders[col] = le
 
         X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=self.test_size, random_state=self.model_params["random_state"]
+            X, y, test_size=self.test_size
         )
 
         return X_train, X_test, y_train, y_test
 
-    def _build_neural_network(self):
-        """Builds a neural network model."""
-        model = Sequential()
-        model.add(Dense(units=self.model_params["hidden_layers"][0], input_dim=self.X_train.shape[1], activation=self.model_params["activation"]))
-        
-        for units in self.model_params["hidden_layers"][1:]:
-            model.add(Dense(units=units, activation=self.model_params["activation"]))
-
-        model.add(Dense(units=1))  # Output layer with 1 neuron for regression
-        model.compile(loss='mean_squared_error', optimizer=Adam(lr=self.model_params["learning_rate"]))
-
-        return model
-
     def fit(self):
-        """Trains the neural network model on training data.
+        """Trains the LightGBM Regressor model on training data, uses grid search to find the best parameters.
 
         Returns:
-            Fitted neural network model.
+            Regressor with the best fit parameters
         """
         self.X_train, self.X_test, self.y_train, self.y_test = self._split_operation_data(self.preprocessed_data)
 
-        self.model = self._build_neural_network()
+        if self.grid_search_flag:
+            reg = lgb.LGBMRegressor(**self.model_params)
+            search = GridSearchCV(
+                reg,
+                param_grid=self.grid_search_parameters,
+                cv=self.cv_splits
+            )
+            search.fit(X=self.X_train, y=self.y_train)
+            reg_bestfit = search.best_estimator_
+        else:
+            reg_bestfit = lgb.LGBMRegressor(**self.model_params)
+            reg_bestfit.fit(self.X_train, self.y_train)
 
-        # Implement early stopping to prevent overfitting
-        early_stopping = EarlyStopping(monitor='val_loss', patience=self.model_params["early_stopping_patience"], verbose=1, restore_best_weights=True)
+        self.best_estimator = reg_bestfit
 
-        self.history = self.model.fit(
-            self.X_train, self.y_train,
-            validation_data=(self.X_test, self.y_test),
-            epochs=self.model_params["epochs"],
-            batch_size=self.model_params["batch_size"],
-            callbacks=[early_stopping],
-            verbose=1
-        )
+        y_preds = reg_bestfit.predict(self.X_test)
 
-        return self.model
+        metrics = self._metrics_calculation(self.y_test, y_preds)
 
-    def predict(self, pred_preprocessed_data, op_data_pred, pred_threshold, prep_models):
+        logger = logging.getLogger(__name__)
+        logger.info(f"Model includes the following features: {self.X_train.columns}")
+        logger.info(f"Model uses the following parameters: {reg_bestfit.get_params()}")
+        logger.info(f"Model's test scores: {metrics}")
+
+        return reg_bestfit
+
+    def predict(self, pred_preprocessed_data):
         """Predict work duration for input list of order numbers.
 
         Args:
             pred_preprocessed_data: Preprocessed data containing features for prediction
-            op_data_pred: Raw pre-scaled operation data
-            pred_threshold: The percentage of difference to adjust based on SAP prediction
-            prep_models: Dict to save/load fitted preprocessing models
         Returns:
-            Dataframe with order number, operation key, non-adjusted prediction, SAP prediction, and adjusted predictions
+            Dataframe with order number, operation key, and predicted values
         """
-        if self.model is None:
+        if self.best_estimator is None:
             print('Please fit the model before predicting')
             return  # Return without making predictions if the model is not fitted
 
@@ -153,38 +147,13 @@ class NeuralNetworkModel:
                 le = self.label_encoders[col]
                 pred_preprocessed_data[col] = le.transform(pred_preprocessed_data[col])
 
-        y_preds = self.model.predict(pred_preprocessed_data)
-
-        if "fitted_scaler" in prep_models:
-            pred_preprocessed_data['key'] = pred_preprocessed_data['order_number'].astype(int).astype(str) + \
-                                            '-' + pred_preprocessed_data['operation_key'].astype(int).astype(str)
-            pred_preprocessed_data.drop(columns=['forecast_man_hours'], inplace=True)
-            pred_preprocessed_data = pred_preprocessed_data.merge(op_data_pred[['key','forecast_man_hours']], how='left', on='key')
-            sap_preds = list(pred_preprocessed_data['forecast_man_hours'])
-        else:
-            sap_preds = list(pred_preprocessed_data['forecast_man_hours'])
-
-        # Adjust predictions based on pred_threshold
-        y_preds_adj = [sap_preds[i] + (y_preds[i][0] - sap_preds[i]) * pred_threshold for i in range(len(y_preds))]
+        X_pred = pred_preprocessed_data.drop(self.features_excluded, axis=1)
+        y_preds = self.best_estimator.predict(X_pred)
 
         final_output = pd.DataFrame({
             'order_number': pred_preprocessed_data['order_number'],
             'operation_key': pred_preprocessed_data['operation_key'],
-            'SAP_pred': sap_preds,
-            'non_adjusted_pred': [round(pred[0], 1) for pred in y_preds],
-            'adjusted_pred': [round(pred, 1) for pred in y_preds_adj]
+            'predicted_values': y_preds
         })
 
         return final_output
-
-    def shap_plot(self):
-        """Create and store a plot for feature importances using SHAP values.
-
-        Returns:
-            Plot
-        """
-        explainer = shap.Explainer(self.model)
-        self.shap_values = explainer.shap_values(self.X_test)
-
-        shap.summary_plot(self.shap_values, self.X_test, show=False)
-        return plt
